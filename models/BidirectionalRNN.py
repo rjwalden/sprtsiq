@@ -5,21 +5,20 @@ import os
 import sys
 import io
 import pickle
-import sagemaker
 import boto3
-
-session = sagemaker.Session(default_bucket = "sprtsiq")
-region = boto3.Session().region_name
-role = sagemaker.get_execution_role(session)
-s3_client = boto3.client('s3')
+import json
 
 import numpy as np
 import pandas as pd
+
+# global vars used by _window_dataset
+df = pd.DataFrame()
+team_mapping = {}
+
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import train_test_split
 
-import sagemaker_containers
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -84,8 +83,10 @@ class NFLDataset(Dataset):
     
     
 def _window_dataset(team, opponent, date, label, season, window):
-    team_games = sorted_df[(sorted_df['Team'] == team) & (sorted_df['Date'] < date)].tail(window)
-    opponent_games = sorted_df[(sorted_df['Team'] == opponent) & (sorted_df['Date'] < date)].tail(window)
+    global df, team_mapping
+    
+    team_games = df[(df['Team'] == team) & (df['Date'] < date)].tail(window)
+    opponent_games = df[(df['Team'] == opponent) & (df['Date'] < date)].tail(window)
     previous_games = pd.concat([team_games, opponent_games])
     previous_games['SampleIndex'] = f'{team}_{opponent}_{date}'
     previous_games['Team'] = previous_games['Team'].apply(lambda team: team_mapping[team])
@@ -100,42 +101,62 @@ def _window_dataset(team, opponent, date, label, season, window):
         return previous_games, label
     
     
-def _build_datasets(window_size):
+def _build_datasets(window_size, is_distributed):
+    global df, team_mapping
+    
     # download the data
+    logger.debug('[_build_datasets]: Downloading the data...')
     s3_client = boto3.client("s3")
-    response = s3_client.get_object(Bucket='sprtsiq', Key="data.csv")
+    response = s3_client.get_object(Bucket='sprtsiq', Key="data/data.csv")
     status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
 
     if status == 200:
-        logger.debug(f"Successful S3 get_object response. Status - {status}")
+        logger.info(f"Successful S3 get_object response. Status - {status}")
         df = pd.read_csv(response.get("Body"))
     else:
-        logger.error(f"Unsuccessful S3 get_object response. Status - {status}")
+        logger.error(f"[_build_datasets]: Unsuccessful S3 get_object response. Status - {status}")
         throw(Exception)
+    logger.debug('[_build_datasets]: Download complete.')
     
-    # get the dataset
-    logger.debug('Windowing the dataset..')
+    sorted_df = df.sort_values(['Date'], ascending=True)
+    sorted_teams = sorted(df['Team'].unique()) # would be smart to include coordinates
+    team_mapping.update({k:v for v,k in enumerate(sorted_teams)})
+    
+    # window the dataset
+    logger.debug('[_build_datasets]: Windowing the dataset..')
     X, y = zip(*df.apply(
         lambda row: _window_dataset(
-            row['Team'], row['Opponent'], row['Date'], row['MoneyLineWinLoss'], row['Season'], window_size
+            row['Team'], 
+            row['Opponent'], 
+            row['Date'], 
+            row['MoneyLineWinLoss'], 
+            row['Season'], 
+            window_size
         ), 
         axis=1
-    )).
-    logger.debug('Windowing complete.')
+    ))
+    logger.debug('[_build_datasets]: Windowing complete.')
+    
+    logger.debug('[_build_datasets]: Dropping empty dataframes and duplicates...')
+    X = pd.Series(X).dropna().iloc[::2]
+    y = pd.Series(y).dropna().iloc[::2]
+    logger.debug('[_build_datasets]: Dropping complete.')
     
     # split the data
+    logger.debug('[_build_datasets]: Splitting the data...')
     PredictionSeason_series = pd.Series([df['PredictionSeason'].iloc[-1] for df in X])
     split = len(PredictionSeason_series[PredictionSeason_series > 2017]) / len(PredictionSeason_series)
-    logger.debug(f'Train-test split: {round(100*(1-split),2)}/{round(100*split,2)}')
+    logger.info(f'Train-test split: {round(100*(1-split),2)}/{round(100*split,2)}')
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=split, shuffle=False)
     X_train = pd.concat(X_train.values.tolist()).drop(columns='SampleIndex')
     X_test = pd.concat(X_test.values.tolist()).drop(columns='SampleIndex')
     y_train = y_train.to_numpy().reshape(-1,1)
     y_test = y_test.to_numpy().reshape(-1,1)
+    logger.debug('[_build_datasets]: Split complete.')
     
     # scale the data
     scalers = {}
-    logger.debug('Scaling the training and testing datasets.')
+    logger.debug('[_build_datasets]: Scaling the training and testing datasets...')
     for col in X_train.columns:
         train_scaler = MinMaxScaler()
         s_s = train_scaler.fit_transform(X_train[col].values.reshape(-1,1))
@@ -148,14 +169,20 @@ def _build_datasets(window_size):
         s_s = np.reshape(s_s,len(s_s))
         scalers['test_scaler_' + col] = test_scaler
         X_test[col] = s_s
+    logger.debug('[_build_datasets]: Scaling complete.')
     
     # build the pytorch datasets
-    logger.debug('Building PyTorch NFLDataset objects')
+    logger.debug('[_build_datasets]: Building PyTorch NFLDataset objects...')
     columns = X_train.columns
     X_train = X_train.values.reshape(-1, window_size*2, X_train.shape[-1])
     X_test = X_test.values.reshape(-1, window_size*2, X_test.shape[-1])
     train_dataset = NFLDataset(X_train, y_train, columns=columns)
     test_dataset = NFLDataset(X_test, y_test, columns=columns)
+    
+    if is_distributed:
+        train_dataset = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    logger.debug('[_build_datasets]: Build complete.')
+    
     return train_dataset, test_dataset
 
 
@@ -169,9 +196,9 @@ def _average_gradients(model):
 
 def train(args):
     is_distributed = len(args.hosts) > 1 and args.backend is not None
-    logger.debug("Distributed training - {}".format(is_distributed))
+    logger.debug("[train]: Distributed training - {}".format(is_distributed))
     use_cuda = args.num_gpus > 0
-    logger.debug("Number of gpus available - {}".format(args.num_gpus))
+    logger.debug("[train]: Number of gpus available - {}".format(args.num_gpus))
     kwargs = {"num_workers": 1, "pin_memory": True} if use_cuda else {}
     device = torch.device("cuda" if use_cuda else "cpu")
 
@@ -193,12 +220,12 @@ def train(args):
     if use_cuda:
         torch.cuda.manual_seed(args.seed)
 
-    train, test = _build_datasets(args.window_size, is_distributed, **kwargs)
+    train, test = _build_datasets(args.window_size, is_distributed)
     train_dataloader = DataLoader(train, batch_size=args.batch_size, shuffle=True)
     test_dataloader = DataLoader(test, batch_size=args.test_batch_size, shuffle=True)
 
     logger.debug(
-        "Processes {}/{} ({:.0f}%) of train data".format(
+        "[train]: Processes {}/{} ({:.0f}%) of train data".format(
             len(train_dataloader.sampler),
             len(train_dataloader.dataset),
             100.0 * len(train_dataloader.sampler) / len(train_dataloader.dataset),
@@ -206,7 +233,7 @@ def train(args):
     )
 
     logger.debug(
-        "Processes {}/{} ({:.0f}%) of test data".format(
+        "[train]: Processes {}/{} ({:.0f}%) of test data".format(
             len(test_dataloader.sampler),
             len(test_dataloader.dataset),
             100.0 * len(test_dataloader.sampler) / len(test_dataloader.dataset),
@@ -230,7 +257,14 @@ def train(args):
         model = torch.nn.DataParallel(model)
 
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    
+    # obtain loss function
+    try:
+        loss_fn = getattr(nn.functional, args.loss_fn)
+    except AttributeError:
+        logging.error('[train]: Invalid value for loss_fn, must be a function of torch.nn.functional')
         
+    history = {'train_loss': [], 'test_loss': [], 'train_acc': [], 'test_acc': []}
     for epoch in range(args.epochs):
         epoch_train_loss = 0
         epoch_test_loss = 0
@@ -270,13 +304,33 @@ def train(args):
             labels_np, bin_preds_np = labels.cpu().detach().numpy(), bin_preds.cpu().detach().numpy()
             epoch_test_acc += balanced_accuracy_score(labels_np, bin_preds_np)
 
+        logger.info("[{}] train loss: {} train acc: {} test loss: {} test acc: {}".format(
+            epoch+1,
+            epoch_train_loss/len(train_dataloader),
+            epoch_train_acc/len(train_dataloader),
+            epoch_test_loss/len(test_dataloader),
+            epoch_test_acc/len(test_dataloader)
+        ))
+        
         history['train_loss'].append(epoch_train_loss/len(train_dataloader))
         history['train_acc'].append(epoch_train_acc/len(train_dataloader))
         history['test_loss'].append(epoch_test_loss/len(test_dataloader))
         history['test_acc'].append(epoch_test_acc/len(test_dataloader))
-        print(f"[{epoch+1}] train loss: {epoch_train_loss/len(train_dataloader)} train acc: {epoch_train_acc/len(train_dataloader)} test loss: {epoch_test_loss/len(test_dataloader)} test acc: {epoch_test_acc/len(test_dataloader)}")
         
-    save_model(model, 's3://sprtsiq/models')
+    best_loss_idx = np.argmin(history['test_loss'])
+    logger.info('Best test_loss [test_loss: {}][epoch: {}]'. format(
+        history['test_loss'][best_loss_idx],
+        best_loss_idx+1
+    ))
+    
+    best_acc_idx = np.argmax(history['test_acc'])
+    logger.info('Best test_acc [test_acc: {}][epoch: {}]'. format(
+        history['test_acc'][best_acc_idx],
+        best_acc_idx+1
+    ))
+    
+    save_model(model, args.model_dir)
+    save_history(history, args.model_dir)
 
 
 def model_fn(model_dir):
@@ -292,6 +346,13 @@ def save_model(model, model_dir):
     path = os.path.join(model_dir, "model.pth")
     # recommended way from http://pytorch.org/docs/master/notes/serialization.html
     torch.save(model.cpu().state_dict(), path)
+    
+    
+def save_history(history, model_dir):
+    logger.info("Saving the history.")
+    path = os.path.join(model_dir, "history.json")
+    with open(path, "w") as outfile:
+        json.dump(history, outfile)
 
 
 if __name__ == "__main__":
@@ -347,7 +408,6 @@ if __name__ == "__main__":
         type=int, 
         default=210, 
         metavar="I", 
-        help="input size (default: 2)"
     )
     
     parser.add_argument(
@@ -402,8 +462,8 @@ if __name__ == "__main__":
     # Container environment
     parser.add_argument("--hosts", type=list, default=json.loads(os.environ["SM_HOSTS"]))
     parser.add_argument("--current-host", type=str, default=os.environ["SM_CURRENT_HOST"])
-#     parser.add_argument("--model-dir", type=str, default=os.environ["SM_MODEL_DIR"])
-#     parser.add_argument("--data-dir", type=str, default=os.environ["SM_CHANNEL_TRAINING"])
+    parser.add_argument("--model-dir", type=str, default=os.environ["SM_MODEL_DIR"])
+    parser.add_argument("--data-dir", type=str, default=os.environ["SM_CHANNEL_TRAINING"])
     parser.add_argument("--num-gpus", type=int, default=os.environ["SM_NUM_GPUS"])
 
     train(parser.parse_args())
